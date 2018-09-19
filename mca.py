@@ -193,3 +193,5 @@ client.on_disconnect = disconnected
 client.loop_background()
 doorChange(0)
 client.publish(doorFeed,"OFF")
+while True:
+    pass
