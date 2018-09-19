@@ -1,8 +1,10 @@
 import psycopg2
 from psycopg2 import Error
 from Adafruit_IO import MQTTClient as mqtt
+import RPi.GPIO as GPIO
 import time
 import datetime
+import socket
 
 userName = "ChinmayTodankar"
 aioKey = "70baad8ab6704f28980fa730936411aa"
@@ -10,12 +12,33 @@ subFeedName = "mca_logincheck"
 pubFeedName = "mca_loginresponse"
 doorFeed = "doorstat"
 addUserFeed = "adduser"
-
+viewLogFeed = "viewlog"
+ip = [l for l in ([ip for ip in socket.gethostbyname_ex(socket.gethostname())[2] if not ip.startswith("127.")][:1], [[(s.connect(('8.8.8.8', 53)), s.getsockname()[0], s.close()) for s in [socket.socket(socket.AF_INET, socket.SOCK_DGRAM)]][0][1]]) if l][0][0]
 client = mqtt(userName,aioKey)
 client.connect()
+servo = 22
+GPIO.setmode(GPIO.BOARD)
+GPIO.setup(servo,GPIO.OUT)
+p=GPIO.PWM(servo,50)# 50hz frequency
+doorStat = False
+p.start(2.5)# starting duty cycle ( it set the servo to 0 degree )
+def connectDb():
+    conn = psycopg2.connect(user="pi",
+                                password="POPROTOTYPE98",
+                                host=ip,
+                                port="5432",
+                                database = "MCA_PROJ")
+    cur = conn.cursor()
+    return conn,cur
 
+def doorChange(n):
+    if n:
+        p.ChangeDutyCycle(6)
+        
+    elif not n:
+        p.ChangeDutyCycle(11)
+        
 def connected(client):
-    print("Connected ")
     client.subscribe(subFeedName)
     client.subscribe(doorFeed)
     client.subscribe(addUserFeed)
@@ -30,14 +53,9 @@ def updateDatabase(usr,cur):
         fname,lname = result[0],result[1]
         print(fname,lname)
     cur.execute("""INSERT INTO log VALUES('{}',TIMESTAMP '{}','{}','{}');""".format(usr,timeStamp,fname,lname))
-def checkUserPass(usr,pswd):
+def checkUserPass(usr,pswd,matchCode):
     try:
-        conn = psycopg2.connect(user="pi",
-                                password="POPROTOTYPE98",
-                                host="192.168.137.215",
-                                port="5432",
-                                database = "MCA_PROJ")
-        cur = conn.cursor()
+        conn,cur = connectDb()
         cur.execute("""SELECT userId FROM logincreds""")
         results = cur.fetchall()
         flag = 0
@@ -54,7 +72,13 @@ def checkUserPass(usr,pswd):
             cur.execute("""SELECT adminrights FROM logincreds WHERE userid = '"""+usr+"""'""")
             results = cur.fetchall()
             print("Correct Password")
-            client.publish(pubFeedName,"Success,"+str(results[:][0][0]))
+            global doorStat
+            doorStatStr = ""
+            if doorStat:
+                doorStatStr = "ON"
+            else:
+                doorStatStr = "OFF"
+            client.publish(pubFeedName,"Success,"+str(results[:][0][0])+","+matchCode+","+doorStatStr)
             updateDatabase(usr,cur)
             conn.commit()
         else:
@@ -62,6 +86,7 @@ def checkUserPass(usr,pswd):
             client.publish(pubFeedName,"NotSuccess")
         return
     except (Exception,psycopg2.DatabaseError) as error:
+        GPIO.cleanup()
         if(conn):
             conn.rollback()
         print("Failed inserting record into mobile table {}".format(error))
@@ -71,17 +96,55 @@ def checkUserPass(usr,pswd):
             conn.close()
 def insertUser(usr,pswd,fname,lname,adminstat):
     try:
-        conn = psycopg2.connect(user="pi",
-                                password="POPROTOTYPE98",
-                                host="192.168.137.215",
-                                port="5432",
-                                database = "MCA_PROJ")
-        cur = conn.cursor()
+        conn,cur = connectDb()
         cur.execute("""InSERT INTO logincreds VALUES('{}','{}','{}','{}','{}')""".format(usr,fname,lname,pswd,adminstat))
         conn.commit()
         print("User Added")
         client.publish(pubFeedName,"UserCreated")
     except (Exception,psycopg2.DatabaseError) as error:
+        GPIO.cleanup()
+        if(conn):
+            conn.rollback()
+        print("Failed inserting record into mobile table {}".format(error))
+    finally:
+        if(conn):
+            cur.close()
+            conn.close()
+
+def modifyVal(usr,col,val):
+    try:
+        conn,cur = connectDb()
+        if(col == "delete"):
+            cur.execute("""DELETE FROM logincreds WHERE userId = '{}' """.format(usr))
+            print("user deleted")
+        else:
+            cur.execute("""UPDATE logincreds SET {} = '{}' WHERE userId = '{}'""".format(col,val,usr))
+            print("value modified")
+        conn.commit()
+        client.publish(pubFeedName,"ChangesDone")
+    except (Exception,psycopg2.DatabaseError) as error:
+        GPIO.cleanup()
+        if(conn):
+            conn.rollback()
+        print("Failed inserting record into mobile table {}".format(error))
+    finally:
+        if(conn):
+            cur.close()
+            conn.close()
+
+def viewData():
+    try:
+        conn,cur = connectDb()
+        cur.execute("""SELECT * FROM log ORDER BY accesstime DESC LIMIT 30""")
+        results = cur.fetchall()
+        payloadStr = []
+        for result in results:
+            payloadStr.append("{} {} accessed the system at {}".format(result[2],result[3],result[1]))
+        for payload in payloadStr:
+            client.publish(viewLogFeed,payload)
+        print("Log Sent")
+    except (Exception,psycopg2.DatabaseError) as error:
+        GPIO.cleanup()
         if(conn):
             conn.rollback()
         print("Failed inserting record into mobile table {}".format(error))
@@ -92,22 +155,41 @@ def insertUser(usr,pswd,fname,lname,adminstat):
 
 def msgReceived(client,id1,msg,retain=True):
     if id1 == subFeedName :
-        username,password = msg.split(",")
-        print(username,password)
-        checkUserPass(username,password)
+        if(msg == "viewData"):
+            viewData()
+        else :
+            username,password,matchCode = msg.split(",")
+            print(username,password)
+            checkUserPass(username,password,matchCode)
     elif id1 == doorFeed :
-        
+        a = False
+        global doorStat
+        if msg == "ON":
+            a = True
+            doorStat = True
+        else:
+            a = False
+            doorStat = False
+        doorChange(a)
         print(msg)
     elif id1 == addUserFeed:
-        usr,pswd,fname,lname,adminstat = msg.split(",")
-        print(usr,pswd,fname,lname,adminstat)
-        insertUser(usr,pswd,fname,lname,adminstat)
+        if(len(list(msg.split(","))) == 5):
+            usr,pswd,fname,lname,adminstat = msg.split(",")
+            print(usr,pswd,fname,lname,adminstat)
+            insertUser(usr,pswd,fname,lname,adminstat)
+        elif(len(list(msg.split(","))) == 3):
+            usr,column,val = msg.split(",")
+            print(usr,column,val)
+            modifyVal(usr,column,val)
     
 
 def disconnected(client):
     print("Disconnected.")
     sys.exit(1)
+    
 client.on_connect = connected
 client.on_message = msgReceived
 client.on_disconnect = disconnected
 client.loop_background()
+doorChange(0)
+client.publish(doorFeed,"OFF")
