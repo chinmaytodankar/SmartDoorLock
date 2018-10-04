@@ -19,6 +19,16 @@ client.connect()
 servo = 22
 GPIO.setmode(GPIO.BOARD)
 GPIO.setup(servo,GPIO.OUT)
+curDoorStat = False
+prevDoorStat = False
+fireSensor = 38
+GPIO.setmode(GPIO.BOARD)
+GPIO.setup(fireSensor,GPIO.IN)
+
+floodSensor = 40
+GPIO.setmode(GPIO.BOARD)
+GPIO.setup(floodSensor,GPIO.IN)
+
 p=GPIO.PWM(servo,50)# 50hz frequency
 doorStat = False
 p.start(2.5)# starting duty cycle ( it set the servo to 0 degree )
@@ -32,11 +42,18 @@ def connectDb():
     return conn,cur
 
 def doorChange(n):
+    global curDoorStat
+    global prevDoorStat
+    if prevDoorStat != curDoorStat:
+        print("DoorChange",end="")
     if n:
+        curDoorStat = True
         p.ChangeDutyCycle(6)
         
     elif not n:
+        curDoorStat = False
         p.ChangeDutyCycle(11)
+    prevDoorStat = curDoorStat
         
 def connected(client):
     client.subscribe(subFeedName)
@@ -94,6 +111,30 @@ def checkUserPass(usr,pswd,matchCode):
         if(conn):
             cur.close()
             conn.close()
+
+def checkFireSensor():
+    fireDetected = GPIO.input(fireSensor)
+ #   print("Fire!!!!!!!!!")
+    return not fireDetected
+
+floodData = []
+i = 0
+def checkFloodSensor():
+    floodDetected = GPIO.input(floodSensor)
+    global floodData
+    if(len(floodData)<10):
+        floodData.append(floodDetected)
+    else:
+        global i
+        floodData[i] = floodDetected
+        i = (i+1)%10
+        if(sum(floodData)==0):
+          #  print("Flood!!!!!!!!!")
+            return True
+        else:
+            return False
+    return
+
 def insertUser(usr,pswd,fname,lname,adminstat):
     try:
         conn,cur = connectDb()
@@ -135,13 +176,14 @@ def modifyVal(usr,col,val):
 def viewData():
     try:
         conn,cur = connectDb()
-        cur.execute("""SELECT * FROM log ORDER BY accesstime DESC LIMIT 30""")
+        cur.execute("""SELECT * FROM log ORDER BY accesstime DESC LIMIT 10""")
         results = cur.fetchall()
         payloadStr = []
         for result in results:
             payloadStr.append("{} {} accessed the system at {}".format(result[2],result[3],result[1]))
         for payload in payloadStr:
             client.publish(viewLogFeed,payload)
+            time.sleep(0.03)
         print("Log Sent")
     except (Exception,psycopg2.DatabaseError) as error:
         GPIO.cleanup()
@@ -185,7 +227,7 @@ def msgReceived(client,id1,msg,retain=True):
 
 def disconnected(client):
     print("Disconnected.")
-    sys.exit(1)
+    client.connect()
     
 client.on_connect = connected
 client.on_message = msgReceived
@@ -193,5 +235,18 @@ client.on_disconnect = disconnected
 client.loop_background()
 doorChange(0)
 client.publish(doorFeed,"OFF")
+firstPub = True
 while True:
-    pass
+    isFire = checkFireSensor()
+    isFlood = checkFloodSensor()
+    print(" isFire : ",isFire," isFlood : ",isFlood)
+    if((isFire or isFlood) and firstPub):
+        firstPub = False
+        doorChange(1)
+        client.publish(doorFeed,"ON")
+    elif(not isFire and not isFlood):
+        if not firstPub:
+            firstPub = True
+            if not curDoorStat:
+                doorChange(0)
+                client.publish(doorFeed,"OFF")
